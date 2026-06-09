@@ -1,185 +1,690 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, random_split
+import os
 import copy
+import random
 import numpy as np
 import matplotlib.pyplot as plt
-import os
 
-# --- CIFAR-10 Dataset ---
-transform = transforms.Compose([
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+
+# ============================================================
+# GOOGLE DRIVE
+# ============================================================
+
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+SAVE_DIR = "/content/drive/MyDrive/GCNN"
+
+os.makedirs(
+    SAVE_DIR,
+    exist_ok=True
+)
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("Using Device:", device)
+
+# ============================================================
+# IEEE STYLE
+# ============================================================
+
+plt.rcParams.update({
+
+    "font.size": 19,
+
+    "axes.titlesize": 19,
+    "axes.labelsize": 19,
+
+    "xtick.labelsize": 19,
+    "ytick.labelsize": 19,
+
+    "legend.fontsize": 19,
+
+    "lines.linewidth": 3
+})
+
+# ============================================================
+# DATA AUGMENTATION
+# ============================================================
+
+train_transform = transforms.Compose([
+
+    transforms.RandomCrop(
+        32,
+        padding=4
+    ),
+
+    transforms.RandomHorizontalFlip(),
+
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+
+    transforms.Normalize(
+        (0.4914, 0.4822, 0.4465),
+        (0.2470, 0.2435, 0.2616)
+    )
 ])
 
-train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+test_transform = transforms.Compose([
 
-num_clients = 1
-client_datasets = random_split(train_dataset, [len(train_dataset)//num_clients]*num_clients)
+    transforms.ToTensor(),
 
-# --- CNN Actor-Critic Model ---
-class CNNActorCritic(nn.Module):
-    def __init__(self, num_actions=10):
-        super(CNNActorCritic, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc = nn.Linear(64*8*8, 128)
-        self.actor = nn.Linear(128, num_actions)
-        self.critic = nn.Linear(128, 1)
+    transforms.Normalize(
+        (0.4914, 0.4822, 0.4465),
+        (0.2470, 0.2435, 0.2616)
+    )
+])
+
+# ============================================================
+# CIFAR-10 DATASET
+# ============================================================
+
+train_dataset = datasets.CIFAR10(
+    root="./data",
+    train=True,
+    download=True,
+    transform=train_transform
+)
+
+test_dataset = datasets.CIFAR10(
+    root="./data",
+    train=False,
+    download=True,
+    transform=test_transform
+)
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+num_clients = 50
+clients_per_round = 20
+
+num_rounds = 120
+local_epochs = 2
+
+batch_size = 128
+
+learning_rates = [
+    0.0005,
+    0.001,
+    0.002,
+    0.003
+]
+
+fed_lambda = 0.0001
+
+# ============================================================
+# NON-IID DATA SPLIT
+# ============================================================
+
+def dirichlet_split(
+        dataset,
+        num_clients=50,
+        alpha=0.7
+):
+
+    labels = np.array(dataset.targets)
+
+    client_indices = {
+        i: [] for i in range(num_clients)
+    }
+
+    class_indices = [
+
+        np.where(labels == c)[0]
+
+        for c in range(10)
+    ]
+
+    for c in range(10):
+
+        np.random.shuffle(
+            class_indices[c]
+        )
+
+        proportions = np.random.dirichlet(
+            alpha * np.ones(num_clients)
+        )
+
+        proportions = (
+            np.cumsum(proportions)
+            * len(class_indices[c])
+        ).astype(int)[:-1]
+
+        splits = np.split(
+            class_indices[c],
+            proportions
+        )
+
+        for i in range(num_clients):
+
+            client_indices[i].extend(
+                splits[i]
+            )
+
+    return client_indices
+
+client_indices = dirichlet_split(
+    train_dataset,
+    num_clients=num_clients,
+    alpha=0.7
+)
+
+# ============================================================
+# FeDR CNN MODEL
+# ============================================================
+
+class FeDRCNN(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.features = nn.Sequential(
+
+            nn.Conv2d(
+                3,
+                64,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(64),
+
+            nn.ReLU(),
+
+            nn.Conv2d(
+                64,
+                64,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(64),
+
+            nn.ReLU(),
+
+            nn.MaxPool2d(2),
+
+            nn.Dropout(0.25),
+
+            nn.Conv2d(
+                64,
+                128,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(128),
+
+            nn.ReLU(),
+
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(128),
+
+            nn.ReLU(),
+
+            nn.MaxPool2d(2),
+
+            nn.Dropout(0.25)
+        )
+
+        self.classifier = nn.Sequential(
+
+            nn.Linear(
+                128 * 8 * 8,
+                512
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.5),
+
+            nn.Linear(
+                512,
+                10
+            )
+        )
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool(x)
-        x = F.relu(self.conv2(x))
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc(x))
-        return F.softmax(self.actor(x), dim=-1), self.critic(x)
 
-# --- Local training function ---
-def train_local(model, optimizer, data_loader, device):
-    model.train()
-    total_loss, total_reward, correct, total = 0, 0, 0, 0
+        x = self.features(x)
+
+        x = x.view(
+            x.size(0),
+            -1
+        )
+
+        x = self.classifier(x)
+
+        return x
+
+# ============================================================
+# FEDER REGULARIZATION
+# ============================================================
+
+def feder_regularization(
+        local_model,
+        global_model
+):
+
+    reg_loss = 0
+
+    for lp, gp in zip(
+            local_model.parameters(),
+            global_model.parameters()
+    ):
+
+        reg_loss += torch.norm(
+            lp - gp,
+            p=2
+        ) ** 2
+
+    return reg_loss
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+def evaluate(
+        model,
+        loader
+):
+
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    total_loss = 0
+
     criterion = nn.CrossEntropyLoss()
 
-    for images, labels in data_loader:
-        images, labels = images.to(device), labels.to(device)
-        probs, value = model(images)
-        dist = torch.distributions.Categorical(probs)
-        actions = labels  # supervised labels as actions
-        log_probs = dist.log_prob(actions)
-        reward = (actions == actions).float()  # always 1
-        advantage = reward - value.squeeze()
+    with torch.no_grad():
 
-        actor_loss = -(log_probs * advantage.detach()).mean()
-        critic_loss = advantage.pow(2).mean()
-        loss = actor_loss + critic_loss
+        for images, labels in loader:
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            images = images.to(device)
+            labels = labels.to(device)
 
-        total_loss += loss.item()
-        total_reward += reward.mean().item()
-        correct += (probs.argmax(dim=1) == labels).sum().item()
-        total += labels.size(0)
+            outputs = model(images)
 
-    accuracy = 1000*correct/total
-    return copy.deepcopy(model.state_dict()), total_reward / len(data_loader), total_loss / len(data_loader), accuracy
+            loss = criterion(
+                outputs,
+                labels
+            )
 
+            total_loss += loss.item()
 
-def dr_weights(local_weights, rewards):
-    best_idx = np.argmax(rewards)
-    return local_weights[best_idx]
+            predictions = torch.argmax(
+                outputs,
+                dim=1
+            )
 
-# --- Federated learning ---
-def federated_learning(
-    algorithm='L2FPPO',
-    num_servers=1,
-    num_clients=1,
-    num_rounds=31,
-    lambda_lr=0.01,
-    queue_step=0.01
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    clients = [CNNActorCritic().to(device) for _ in range(num_clients)]
-    optimizers = [optim.Adam(c.parameters(), lr=1e-5) for c in clients]
-    global_model = CNNActorCritic().to(device)
+            correct += (
+                predictions == labels
+            ).sum().item()
 
-    reward_curve, loss_curve, acc_curve = [], [], []
-    lambdas = [0.1 for _ in range(num_clients)]
-    queue_lengths = [1.0 for _ in range(num_clients)]
-    powers = [1.0 for _ in range(num_clients)]
+            total += labels.size(0)
 
-    for rnd in range(num_rounds):
-        local_weights, local_rewards, local_losses, local_accs = [], [], [], []
+    accuracy = correct / total
 
-        for i, client in enumerate(clients):
-            loader = DataLoader(client_datasets[i], batch_size=32, shuffle=True)
-            client.train()
-            total_loss, total_reward, correct, total = 0, 0, 0, 0
+    avg_loss = total_loss / len(loader)
 
-            for images, labels in loader:
-                images, labels = images.to(device), labels.to(device)
-                probs, value = client(images)
-                dist = torch.distributions.Categorical(probs)
-                actions = labels
-                log_probs = dist.log_prob(actions)
-                reward = (probs.argmax(dim=1) == labels).float().mean()  # accuracy as reward proxy
+    return avg_loss, accuracy
 
-                advantage = reward - value.mean()
-                actor_loss = -(log_probs * advantage.detach()).mean()
-                critic_loss = advantage.pow(2).mean()
+# ============================================================
+# TEST LOADER
+# ============================================================
 
-                # --- Lagrange–Lyapunov loss integration ---
-                if algorithm == 'L2FPPO':
-                    lagrangian_term = lambdas[i] * (queue_lengths[i] - powers[i])
-                    lyapunov_term = 0.5 * (queue_lengths[i] ** 2)
-                    loss = actor_loss + critic_loss + 0.01 * lagrangian_term + 0.001 * lyapunov_term
-                else:
-                    loss = actor_loss + critic_loss
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
 
-                optimizers[i].zero_grad()
-                loss.backward()
-                optimizers[i].step()
+# ============================================================
+# RESULTS
+# ============================================================
 
-                total_loss += loss.item()
-                total_reward += reward.item()
-                correct += (probs.argmax(dim=1) == labels).sum().item()
-                total += labels.size(0)
-
-            avg_acc = correct / total
-            avg_reward = total_reward / len(loader)
-            avg_loss = total_loss / len(loader)
-
-            # Update Lyapunov queue and Lagrange multiplier
-            queue_lengths[i] += queue_step * (queue_lengths[i] - avg_reward)
-            lambdas[i] = max(0, lambdas[i] + lambda_lr * (queue_lengths[i] - powers[i]))
-
-            local_weights.append(copy.deepcopy(client.state_dict()))
-            local_rewards.append(avg_reward)
-            local_losses.append(avg_loss)
-            local_accs.append(avg_acc)
-
-            # Print per-client details
-            print(f"Client {i+1}: λ={lambdas[i]:.4f}, Q={queue_lengths[i]:.4f}, "
-                  f"Reward={avg_reward:.4f}, Loss={avg_loss:.4f}, Acc={avg_acc:.4f}")
-
-        # --- Aggregation phase ---
-        if algorithm == "L2FPPO":
-            new_weights =dr_weights(local_weights, local_rewards)       
-        else:
-            raise ValueError("Unknown algorithm")
-
-        global_model.load_state_dict(new_weights)
-        for client in clients:
-            client.load_state_dict(new_weights)
-
-        # --- Global logging ---
-        reward_curve.append(np.mean(local_rewards))
-        loss_curve.append(np.mean(local_losses))
-        acc_curve.append(np.mean(local_accs))
-
-        print(f"[{algorithm}] Round {rnd+1}/{num_rounds} | "
-              f"Avg Reward={reward_curve[-1]:.4f} | Avg Loss={loss_curve[-1]:.4f} | "
-              f"Avg Acc={acc_curve[-1]:.4f}\n")
-
-    return reward_curve, loss_curve, acc_curve
-
-
-# --- Run all four algorithms ---
-algorithms = ["L2FPPO"]
 results = {}
 
-for algo in algorithms:
-    print(f"=== Training {algo} ===")
-    reward, loss, acc = federated_learning(algo, num_rounds=31)
-    results[algo] = {"reward": reward, "loss": loss, "acc": acc}
+# ============================================================
+# TRAINING
+# ============================================================
 
+for lr in learning_rates:
 
+    print(f"\n===== Learning Rate {lr} =====")
+
+    global_model = FeDRCNN().to(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    round_losses = []
+    round_accuracies = []
+
+    for rnd in range(num_rounds):
+
+        selected_clients = np.random.choice(
+            range(num_clients),
+            clients_per_round,
+            replace=False
+        )
+
+        local_weights = []
+
+        # ====================================================
+        # CLIENT TRAINING
+        # ====================================================
+
+        for client_id in selected_clients:
+
+            indices = client_indices[client_id]
+
+            if len(indices) < batch_size:
+                continue
+
+            subset = Subset(
+                train_dataset,
+                indices
+            )
+
+            loader = DataLoader(
+                subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=2,
+                pin_memory=True
+            )
+
+            local_model = copy.deepcopy(
+                global_model
+            ).to(device)
+
+            optimizer = optim.AdamW(
+                local_model.parameters(),
+                lr=lr,
+                weight_decay=1e-4
+            )
+
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=local_epochs
+            )
+
+            local_model.train()
+
+            # ====================================================
+            # LOCAL EPOCHS
+            # ====================================================
+
+            for epoch in range(local_epochs):
+
+                for images, labels in loader:
+
+                    images = images.to(device)
+                    labels = labels.to(device)
+
+                    optimizer.zero_grad()
+
+                    outputs = local_model(images)
+
+                    ce_loss = criterion(
+                        outputs,
+                        labels
+                    )
+
+                    reg_loss = feder_regularization(
+                        local_model,
+                        global_model
+                    )
+
+                    loss = (
+                        ce_loss
+                        + fed_lambda * reg_loss
+                    )
+
+                    loss.backward()
+
+                    torch.nn.utils.clip_grad_norm_(
+                        local_model.parameters(),
+                        5.0
+                    )
+
+                    optimizer.step()
+
+                scheduler.step()
+
+            local_weights.append(
+                copy.deepcopy(
+                    local_model.state_dict()
+                )
+            )
+
+        # ====================================================
+        # FEDERATED AVERAGING
+        # ====================================================
+
+        global_weights = global_model.state_dict()
+
+        for key in global_weights.keys():
+
+            global_weights[key] = torch.stack([
+
+                local_weights[i][key].float()
+
+                for i in range(len(local_weights))
+
+            ], dim=0).mean(dim=0)
+
+        global_model.load_state_dict(
+            global_weights
+        )
+
+        # ====================================================
+        # EVALUATION
+        # ====================================================
+
+        test_loss, test_acc = evaluate(
+            global_model,
+            test_loader
+        )
+
+        round_losses.append(
+            test_loss
+        )
+
+        round_accuracies.append(
+            test_acc
+        )
+
+        if (rnd + 1) % 10 == 0:
+
+            print(
+                f"Round [{rnd+1}/{num_rounds}] | "
+                f"Loss: {test_loss:.4f} | "
+                f"Accuracy: {test_acc:.4f}"
+            )
+
+    results[str(lr)] = {
+
+        "loss": round_losses,
+        "accuracy": round_accuracies
+    }
+
+# ============================================================
+# SMOOTH FUNCTION
+# ============================================================
+
+def smooth(signal, alpha=0.2):
+
+    smoothed = []
+
+    last = signal[0]
+
+    for point in signal:
+
+        last = (
+            alpha * point
+            + (1 - alpha) * last
+        )
+
+        smoothed.append(last)
+
+    return smoothed
+
+# ============================================================
+# LOSS PLOT
+# ============================================================
+
+plt.figure(figsize=(10, 7))
+
+for lr in learning_rates:
+
+    y = smooth(
+        results[str(lr)]["loss"],
+        alpha=0.2
+    )
+
+    plt.plot(
+        np.arange(len(y)),
+        y,
+        label=f"lr={lr}"
+    )
+
+plt.xlabel("Communication Rounds")
+
+plt.ylabel("Loss")
+
+plt.legend(
+    loc='upper right',
+    frameon=False
+)
+
+plt.grid(
+    True,
+    linestyle="--",
+    alpha=0.6
+)
+
+plt.tight_layout()
+
+loss_path = os.path.join(
+    SAVE_DIR,
+    "FeDR_CIFAR10_Loss.pdf"
+)
+
+plt.savefig(
+    loss_path,
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+print("Saved:", loss_path)
+
+# ============================================================
+# ACCURACY PLOT
+# ============================================================
+
+plt.figure(figsize=(10, 7))
+
+for lr in learning_rates:
+
+    y = smooth(
+        results[str(lr)]["accuracy"],
+        alpha=0.2
+    )
+
+    plt.plot(
+        np.arange(len(y)),
+        y,
+        label=f"lr={lr}"
+    )
+
+plt.xlabel("Communication Rounds")
+
+plt.ylabel("Accuracy")
+
+plt.legend(
+    loc='lower right',
+    frameon=False
+)
+
+plt.grid(
+    True,
+    linestyle="--",
+    alpha=0.6
+)
+
+plt.tight_layout()
+
+acc_path = os.path.join(
+    SAVE_DIR,
+    "FeDR_CIFAR10_Accuracy.pdf"
+)
+
+plt.savefig(
+    acc_path,
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+print("Saved:", acc_path)
+
+# ============================================================
+# FINAL RESULTS
+# ============================================================
+
+print("\n================ FINAL RESULTS ================\n")
+
+for lr in learning_rates:
+
+    final_loss = results[str(lr)]["loss"][-1]
+
+    final_acc = results[str(lr)]["accuracy"][-1]
+
+    print(
+        f"LR={lr} | "
+        f"Final Loss={final_loss:.4f} | "
+        f"Final Accuracy={final_acc:.4f}"
+    )
